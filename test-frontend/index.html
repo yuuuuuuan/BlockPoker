@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>BlockPoker Test Login</title>
+  <style>
+    #logs {
+      border: 1px solid #ccc;
+      padding: 10px;
+      width: 95%;
+      height: 300px;
+      overflow-y: scroll;
+      background: #f7f7f7;
+      font-family: monospace;
+      white-space: pre-wrap;
+    }
+    button { margin-right: 8px; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <h1>BlockPoker 测试登录</h1>
+
+  <button id="connect">连接 MetaMask</button>
+  <button id="login">登录（签名）</button>
+  <button id="join">匹配 Join</button>
+  <button id="ws">连接 WebSocket</button>
+
+  <h2>Logs</h2>
+  <div id="logs"></div>
+
+  <script>
+    const backend = "http://localhost:8080";
+
+    let wallet = "";
+    let jwt = "";
+
+    function log(...args) {
+      const box = document.getElementById("logs");
+      const text = args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : a).join(" ");
+      box.textContent += text + "\n";
+      box.scrollTop = box.scrollHeight;
+      console.log(...args);
+    }
+
+    // 把 UTF-8 字符串转换为 0x 前缀的 hex（浏览器兼容，不依赖 Buffer）
+    function utf8ToHex(str) {
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(String(str));
+      return '0x' + Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // 判断是否为 0x 开头的 hex
+    function is0xHex(s) {
+      return typeof s === 'string' && /^0x[0-9a-f]+$/i.test(s);
+    }
+
+    // 判断是否为裸 hex（无 0x 前缀，且偶数字符数）
+    function isBareHex(s) {
+      return typeof s === 'string' && /^[0-9a-f]+$/i.test(s) && (s.length % 2 === 0);
+    }
+
+    // 把后端返回的 nonce 统一转换为 personal_sign 接受的 hex message
+    function toPersonalSignHexMessage(nonce) {
+      if (typeof nonce !== 'string') nonce = String(nonce);
+
+      // 1) 如果已经是 0x... 的 hex（表示想签 raw bytes），直接返回
+      if (is0xHex(nonce)) {
+        return nonce;
+      }
+      // 2) 如果是裸 hex（例如后端返回 "dac8..."），把它视为 raw bytes hex
+      if (isBareHex(nonce)) {
+        return '0x' + nonce;
+      }
+      // 3) 否则把它当作普通 UTF-8 字符串，转为 hex（这是推荐也最常见的）
+      return utf8ToHex(nonce);
+    }
+
+    // 1. 连接 MetaMask
+    document.getElementById("connect").onclick = async () => {
+      try {
+        if (!window.ethereum) {
+          log("找不到 MetaMask (window.ethereum)。请安装或启用扩展。");
+          return;
+        }
+        const accounts = await window.ethereum.request({
+          method: "eth_requestAccounts"
+        });
+        wallet = accounts[0];
+        log("钱包地址:", wallet);
+      } catch (err) {
+        log("连接 MetaMask 出错:", err && err.message ? err.message : err);
+      }
+    };
+
+    // 2. 登录流程
+    document.getElementById("login").onclick = async () => {
+      try {
+        if (!wallet) {
+          log("请先连接钱包（点击 Connect）。");
+          return;
+        }
+
+        const nonceResp = await fetch(`${backend}/auth/nonce?address=${wallet}`);
+        if (!nonceResp.ok) {
+          log("获取 nonce 失败，status:", nonceResp.status);
+          return;
+        }
+        const json = await nonceResp.json();
+        const nonce = json.nonce;
+        log("后端返回 nonce:", nonce);
+
+        // 把 nonce 转为 MetaMask 要求的 hex message（兼容多种后端返回格式）
+        const hexMessage = toPersonalSignHexMessage(nonce);
+        log("传给 personal_sign 的 hex:", hexMessage);
+
+        // 请求 MetaMask 签名
+        const sig = await window.ethereum.request({
+          method: "personal_sign",
+          params: [hexMessage, wallet]
+        });
+        log("MetaMask 返回 signature:", sig);
+
+        // 发送 login 请求给后端，注意传回后端的 nonce 应该是原样后端给出的（不要把 hexMessage 当作 nonce 发回去）
+        const loginResp = await fetch(`${backend}/auth/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ address: wallet, signature: sig, nonce: nonce })
+        });
+
+        if (!loginResp.ok) {
+          const errBody = await loginResp.json().catch(() => ({}));
+          log("登录失败:", loginResp.status, errBody);
+          return;
+        }
+
+        const data = await loginResp.json();
+        jwt = data.jwt;
+        localStorage.setItem("token", jwt);
+
+        log("登录成功，JWT:", jwt);
+      } catch (err) {
+        log("登录流程异常:", err && err.message ? err.message : err);
+      }
+    };
+
+    // 3. 匹配 Join
+    document.getElementById("join").onclick = async () => {
+      try {
+        const resp = await fetch(`${backend}/match/join`, {
+          method: "POST",
+          headers: {
+            "Authorization": "Bearer " + localStorage.getItem("token"),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+      address: wallet,    // 必填：用户钱包地址
+      pool: "test",       // 必填：你后台需要的池名
+      tableSize: 2    // 可选：牌桌人数，默认 2
+          }),
+        });
+
+        const data = await resp.json();
+        log("join 返回:", data);
+      } catch (err) {
+        log("join 出错:", err && err.message ? err.message : err);
+      }
+    };
+
+    // 4. WebSocket
+    document.getElementById("ws").onclick = () => {
+      try {
+        const t = localStorage.getItem("token");
+        if (!t) return log("请先登录并获取 JWT。");
+        const ws = new WebSocket(`ws://localhost:8888/ws?token=${encodeURIComponent(t)}`);
+
+        ws.onopen = () => log("WebSocket 连接成功");
+        ws.onmessage = (e) => log("WS 收到消息:", e.data);
+        ws.onerror = (e) => log("WS 错误:", e);
+        ws.onclose = () => log("WS 已关闭");
+      } catch (err) {
+        log("WebSocket 建立失败:", err && err.message ? err.message : err);
+      }
+    };
+  </script>
+</body>
+</html>

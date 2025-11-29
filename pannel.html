@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>BlockPoker 测试面板（修复 MetaMask 提示）</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  body{font-family: system-ui, "Helvetica Neue", Arial; background:#0b1020; color:#e6eef8; padding:18px}
+  input,button,select{padding:6px 8px;margin:6px;border-radius:6px;border:1px solid #334; background:#071022; color:#e6eef8}
+  button {cursor:pointer}
+  #log{height:300px; overflow:auto; background:#041026; border:1px solid #223; padding:8px; white-space:pre-wrap}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+  label{min-width:80px}
+  .small{font-size:0.9rem;color:#a9b7c6}
+</style>
+</head>
+<body>
+  <h2>🃏 BlockPoker 调试面板（支持 MetaMask & 手动地址）</h2>
+
+  <div class="row">
+    <label>当前地址</label>
+    <input id="addr" value="0xAAA" size="20" />
+    <button id="connectWalletBtn">连接钱包 (MetaMask)</button>
+    <button id="connectWsBtn">连接 WebSocket</button>
+    <span class="small" id="authStatus">未登录</span>
+  </div>
+
+  <div class="row">
+    <label>匹配</label>
+    池 <input id="pool" value="default" size="8" />
+    桌人数 <input id="tableSize" value="2" size="2" />
+    <button onclick="joinMatch()">加入匹配</button>
+    <button onclick="cancelMatch()">取消匹配</button>
+  </div>
+
+  <div class="row">
+    <label>游戏操作</label>
+    <button onclick="sendAction('bet',{amount:100})">下注 100</button>
+    <button onclick="sendAction('fold',{})">弃牌</button>
+  </div>
+
+  <h3>📡 WebSocket</h3>
+  <div class="row">
+    <label>状态</label>
+    <span id="wsStatus">未连接</span>
+    <label style="min-width:60px">Token</label>
+    <input id="token" style="width:420px" placeholder="如果有 JWT 可粘贴或由钱包登录自动填写"/>
+  </div>
+
+  <h3>📜 日志</h3>
+  <div id="log"></div>
+
+<script>
+/*
+  说明：
+  - 支持 MetaMask 登录流程（nonce -> personal_sign -> /auth/verify）
+  - 如果没有 MetaMask，会切换到“手动地址”模式，不会强制弹窗
+  - WebSocket 会在连接时把 token 作为 query param ?token=... （中间件需支持）
+  - HTTP 请求（加入匹配/取消）如果 token 存在，会自动带 Authorization header
+*/
+
+// CONFIG：根据后端实际地址修改
+const API_BASE = "http://localhost:8080";
+const WS_BASE = "ws://localhost:8080/ws";
+
+const logDiv = document.getElementById('log');
+const addrInput = document.getElementById('addr');
+const tokenInput = document.getElementById('token');
+const authStatus = document.getElementById('authStatus');
+const wsStatus = document.getElementById('wsStatus');
+let ws = null;
+let currentAddress = addrInput.value || "";
+let jwtToken = "";
+
+// 日志函数
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logDiv.innerText = `[${t}] ${msg}\n` + logDiv.innerText;
+}
+
+// 检查是否有 MetaMask（window.ethereum）
+function hasMetaMask() {
+  return typeof window.ethereum !== 'undefined' && !!window.ethereum.request;
+}
+
+// 连接 MetaMask 并登录（EIP-191 personal_sign 风格）
+async function connectWallet() {
+  if (!hasMetaMask()) {
+    log("⚠️ 未检测到 MetaMask（或其它 injected provider）。切换到手动地址模式。");
+    return;
+  }
+
+  try {
+    // 请求账户访问
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    if (!accounts || accounts.length === 0) {
+      log("❌ 未授权钱包地址");
+      return;
+    }
+    const address = accounts[0];
+    addrInput.value = address;
+    currentAddress = address;
+    log("✅ 钱包已连接: " + address);
+
+    // 获取服务器 nonce
+    const nonceResp = await fetch(`${API_BASE}/auth/nonce?address=${encodeURIComponent(address)}`);
+    if (!nonceResp.ok) {
+      const txt = await nonceResp.text();
+      log("❌ 获取 nonce 失败: " + txt);
+      return;
+    }
+    const nonceJson = await nonceResp.json();
+    const nonce = nonceJson.nonce || nonceJson.Nonce || nonceJson;
+    const message = `Login to PokerServer: nonce-${nonce}`;
+    log("🔏 待签名消息: " + message);
+
+    // 使用 personal_sign 签名（部分钱包需要参数顺序反）
+    // 尝试 multiple variants for compatibility
+    let signature = "";
+    try {
+      // MetaMask prefers personal_sign(params: [msg, address])
+      signature = await window.ethereum.request({
+        method: 'personal_sign',
+        params: [message, address],
+      });
+    } catch (err1) {
+      // fallback try eth_sign
+      try {
+        signature = await window.ethereum.request({ method: 'eth_sign', params: [address, message] });
+      } catch (err2) {
+        log("❌ 签名失败: " + (err2 && err2.message ? err2.message : err1.message));
+        return;
+      }
+    }
+
+    // 提交 verify 获取 JWT
+    const verifyResp = await fetch(`${API_BASE}/auth/verify`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address, nonce, signature})
+    });
+    if (!verifyResp.ok) {
+      const txt = await verifyResp.text();
+      log("❌ 登录验证失败: " + txt);
+      return;
+    }
+    const verifyJson = await verifyResp.json();
+    jwtToken = verifyJson.token || "";
+    tokenInput.value = jwtToken;
+    authStatus.innerText = "已登录（钱包）";
+    log("✅ 登录成功，JWT 已获取");
+  } catch (err) {
+    log("❌ connectWallet 错误: " + (err.message || err));
+  }
+}
+
+// 连接 WebSocket（会在 URL 中传 token，如果有）
+function connectWS() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    log("⚠️ WS 已存在，先断开再重连");
+    ws.close();
+    ws = null;
+  }
+  const token = tokenInput.value.trim();
+  // 使用 token 作为 query param（中间件需支持）
+  const url = token ? `${WS_BASE}?token=${encodeURIComponent(token)}` : WS_BASE;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    wsStatus.innerText = "已连接";
+    log("✅ WebSocket 已连接: " + url);
+    // 如果没有 JWT，但有地址，主动注册地址（后端可支持 register 消息）
+    const addr = addrInput.value.trim();
+    if (!token && addr) {
+      const reg = { event: "register", data: { address: addr } };
+      ws.send(JSON.stringify(reg));
+      log("➡️ 已通过 WS 注册地址: " + addr + "（非认证模式）");
+    }
+  };
+
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      log("📩 收到: " + JSON.stringify(msg));
+    } catch (e) {
+      log("⚠️ 收到非 JSON: " + ev.data);
+    }
+  };
+
+  ws.onclose = () => {
+    wsStatus.innerText = "断开";
+    log("❌ WebSocket 已断开");
+  };
+
+  ws.onerror = (e) => {
+    log("⚠️ WebSocket 错误");
+    console.error(e);
+  };
+}
+
+// 加入匹配（HTTP）
+async function joinMatch() {
+  const address = addrInput.value.trim();
+  const pool = document.getElementById('pool').value;
+  const tableSize = parseInt(document.getElementById('tableSize').value) || 2;
+  const body = { address, pool, tableSize };
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (tokenInput.value.trim()) headers['Authorization'] = 'Bearer ' + tokenInput.value.trim();
+
+  try {
+    log("➡️ 发起 /match/join 请求: " + JSON.stringify(body));
+    const resp = await fetch(`${API_BASE}/match/join`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    log("✅ /match/join 返回: " + JSON.stringify(data));
+  } catch (err) {
+    log("❌ joinMatch 错误: " + (err.message || err));
+  }
+}
+
+// 取消匹配
+async function cancelMatch() {
+  const address = addrInput.value.trim();
+  const headers = { 'Content-Type': 'application/json' };
+  if (tokenInput.value.trim()) headers['Authorization'] = 'Bearer ' + tokenInput.value.trim();
+
+  try {
+    log("➡️ 发起 /match/cancel 请求: " + address);
+    const resp = await fetch(`${API_BASE}/match/cancel`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ address }),
+    });
+    const data = await resp.json();
+    log("✅ /match/cancel 返回: " + JSON.stringify(data));
+  } catch (err) {
+    log("❌ cancelMatch 错误: " + (err.message || err));
+  }
+}
+
+// 通过 WS 发送动作（action）
+function sendAction(action, extra) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log("⚠️ WebSocket 未连接，无法发送动作");
+    return;
+  }
+  const payload = Object.assign({ action }, extra || {});
+  const msg = { event: "player_action", data: payload };
+  ws.send(JSON.stringify(msg));
+  log("➡️ WS 发送: " + JSON.stringify(msg));
+}
+
+// 绑定按钮事件
+document.getElementById('connectWalletBtn').addEventListener('click', connectWallet);
+document.getElementById('connectWsBtn').addEventListener('click', connectWS);
+
+// 如果页面首次加载检测到 MetaMask，则自动提示（非弹窗）
+window.addEventListener('load', () => {
+  if (hasMetaMask()) {
+    log("检测到 MetaMask，可使用 钱包登录（Connect Wallet）");
+  } else {
+    log("未检测到 MetaMask，页面已自动切换为手动地址模式（不会弹窗）");
+  }
+});
+</script>
+</body>
+</html>

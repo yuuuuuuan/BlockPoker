@@ -1,0 +1,13 @@
+server:
+  port: ":8080"
+
+database:
+  dsn: "postgres://user:password@localhost:5432/poker?sslmode=disable"
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+jwt:
+  secret: "a09dsf80as9df8s0a98df098a0sd8f09as8df098asdf0a98sdf"

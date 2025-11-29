@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>BlockPoker 测试面板 (Web3 登录)</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #eee; padding: 20px; }
+    input, button { margin: 4px; padding: 4px 8px; }
+    #log { white-space: pre-line; border: 1px solid #444; padding: 8px; height: 300px; overflow-y: scroll; background: #000; }
+  </style>
+</head>
+<body>
+
+<h2>🃏 BlockPoker - Web3 测试面板</h2>
+
+<button onclick="connectWallet()">连接 MetaMask</button>
+<button onclick="loginWithWallet()">链上登录(JWT)</button>
+
+<div id="wallet"></div>
+<div id="jwt"></div>
+
+<h3>📡 WebSocket</h3>
+<div id="status">未连接</div>
+<button onclick="connectWS()">连接 WebSocket</button>
+
+<h3>🧩 匹配</h3>
+池名: <input id="pool" value="default" size="8">
+桌人数: <input id="tableSize" value="2" size="2">
+<button onclick="joinMatch()">加入匹配</button>
+<button onclick="cancelMatch()">取消匹配</button>
+
+<h3>🎮 动作</h3>
+<button onclick="sendAction('bet',{amount:100})">下注100</button>
+<button onclick="sendAction('fold',{})">弃牌</button>
+
+<h3>📜 日志</h3>
+<div id="log"></div>
+
+<script>
+let selectedAddress = "";
+let jwtToken = "";
+let ws;
+
+//-------- 工具 ----------
+const logDiv = document.getElementById('log');
+function log(msg) {
+  logDiv.innerText += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  logDiv.scrollTop = logDiv.scrollHeight;
+}
+
+//-------- MetaMask 连接 ----------
+async function connectWallet() {
+  if (!window.ethereum) {
+    log("❌ 请安装 MetaMask");
+    return;
+  }
+  const accounts = await ethereum.request({method: "eth_requestAccounts"});
+  selectedAddress = accounts[0];
+  document.getElementById("wallet").innerText = "钱包地址: " + selectedAddress;
+  log("🔌 已连接钱包: " + selectedAddress);
+}
+
+//-------- 使用钱包签名并换 JWT ----------
+async function loginWithWallet() {
+  if (!selectedAddress) return log("请先连接钱包");
+
+  const message = "BlockPoker Login: " + selectedAddress + " " + Date.now();
+
+  const signature = await ethereum.request({
+    method: "personal_sign",
+    params: [message, selectedAddress]
+  });
+
+  log("📝 已签名: " + signature);
+
+  // 发送到后端换 JWT
+  const resp = await fetch("http://localhost:8080/auth/web3", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({address: selectedAddress, message, signature})
+  });
+  const data = await resp.json();
+  jwtToken = data.token;
+
+  document.getElementById("jwt").innerText = "JWT: " + jwtToken;
+  log("🎫 得到 JWT: " + jwtToken);
+}
+
+//-------- WebSocket ----------
+function connectWS() {
+  if (!jwtToken) return log("请先登录获取 JWT");
+
+  ws = new WebSocket(`ws://localhost:8080/ws?token=${jwtToken}`);
+
+  ws.onopen = () => {
+    log("✅ WS 已连接");
+    document.getElementById('status').innerText = "已连接";
+  };
+
+  ws.onmessage = (ev) => log("📩 " + ev.data);
+
+  ws.onclose = () => {
+    log("❌ WS 断开");
+    document.getElementById('status').innerText = "断开";
+  };
+}
+
+//-------- 匹配 ----------
+async function joinMatch() {
+  if (!jwtToken) return log("请先登录");
+
+  const pool = document.getElementById('pool').value;
+  const tableSize = parseInt(document.getElementById('tableSize').value);
+
+  const resp = await fetch("http://localhost:8080/match/join", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + jwtToken
+    },
+    body: JSON.stringify({pool, tableSize})
+  });
+
+  const data = await resp.json();
+  log("加入匹配返回: " + JSON.stringify(data));
+}
+
+async function cancelMatch() {
+  if (!jwtToken) return log("请先登录");
+
+  const resp = await fetch("http://localhost:8080/match/cancel", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + jwtToken
+    }
+  });
+
+  const data = await resp.json();
+  log("取消返回: " + JSON.stringify(data));
+}
+
+//-------- 游戏动作 ----------
+function sendAction(action, data) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return log("WS 未连接");
+
+  const msg = {type: "action", data: {action, ...data}};
+  ws.send(JSON.stringify(msg));
+  log("发送动作: " + JSON.stringify(msg));
+}
+</script>
+
+</body>
+</html>
